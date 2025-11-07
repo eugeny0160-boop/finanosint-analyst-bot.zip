@@ -106,33 +106,40 @@ async def send_summary_to_channel(period_name: str, days: int):
     except Exception as e:
         logging.error(f"Send error: {e}")
 
-# === HTTP-сервер для cron ===
+# === HTTP-сервер для cron (теперь использует переменную PORT) ===
 class CronHandler(BaseHTTPRequestHandler):
     def do_POST(self):
-        asyncio.run(self.handle_request())
+        # Используем asyncio.run в отдельном потоке, если нужно, но для простоты:
+        # Запускаем корутину в основном цикле (это работает в потоке)
+        try:
+            if self.path == "/daily":
+                asyncio.run(send_summary_to_channel("Аналитическая записка за день", 1))
+            elif self.path == "/weekly":
+                asyncio.run(send_summary_to_channel("Аналитическая записка за неделю", 7))
+            elif self.path == "/monthly":
+                asyncio.run(send_summary_to_channel("Аналитическая записка за месяц", 30))
+            elif self.path == "/halfyear":
+                asyncio.run(send_summary_to_channel("Аналитическая записка за 6 месяцев", 183))
+            elif self.path == "/yearly":
+                asyncio.run(send_summary_to_channel("Аналитическая записка за год", 365))
+            else:
+                self.send_response(404)
+                self.end_headers()
+                return
 
-    async def handle_request(self):
-        if self.path == "/daily":
-            await send_summary_to_channel("Аналитическая записка за день", 1)
-        elif self.path == "/weekly":
-            await send_summary_to_channel("Аналитическая записка за неделю", 7)
-        elif self.path == "/monthly":
-            await send_summary_to_channel("Аналитическая записка за месяц", 30)
-        elif self.path == "/halfyear":
-            await send_summary_to_channel("Аналитическая записка за 6 месяцев", 183)
-        elif self.path == "/yearly":
-            await send_summary_to_channel("Аналитическая записка за год", 365)
-        else:
-            self.send_response(404)
+            self.send_response(200)
             self.end_headers()
-            return
-
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
+            self.wfile.write(b"OK")
+        except Exception as e:
+            logging.error(f"HTTP handler error: {e}")
+            self.send_response(500)
+            self.end_headers()
+            self.wfile.write(b"Internal Server Error")
 
 def start_http_server():
-    server = HTTPServer(("", 8000), CronHandler)
+    # Получаем порт из переменной окружения PORT (Render передаёт её)
+    port = int(os.environ.get('PORT', 8000))  # Используем 8000 как fallback, но Render даст PORT
+    server = HTTPServer(('0.0.0.0', port), CronHandler) # Обязательно bind на 0.0.0.0
     server.serve_forever()
 
 # === Обработка постов из канала ===
@@ -147,8 +154,9 @@ async def handle_channel_post(update, context):
 
 # === Запуск ===
 if __name__ == "__main__":
-    # Запуск HTTP-сервера в фоне
+    # Запуск HTTP-сервера в фоне на PORT
     threading.Thread(target=start_http_server, daemon=True).start()
+    logging.info("HTTP Server started on PORT")
 
     # Запуск Telegram-бота
     app = Application.builder().token(BOT_TOKEN).build()
