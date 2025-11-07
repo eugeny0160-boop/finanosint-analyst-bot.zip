@@ -5,7 +5,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from telegram import Bot
 from telegram.ext import Application, MessageHandler, filters
-from supabase import create_client
+import psycopg2
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
 import json
@@ -13,47 +13,79 @@ import json
 # === Конфигурация ===
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")  # Например: @finanosint или -1001234567890
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL")  # Формат: postgresql://[user]:[password]@[host]:[port]/[database]
 
-if not all([BOT_TOKEN, CHANNEL_ID, SUPABASE_URL, SUPABASE_KEY]):
+if not all([BOT_TOKEN, CHANNEL_ID, SUPABASE_DB_URL]):
     raise EnvironmentError("Missing required environment variables")
 
 bot = Bot(token=BOT_TOKEN)
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 logging.basicConfig(level=logging.INFO)
 
-# === Работа с БД ===
+# === Работа с БД (PostgreSQL) ===
+def get_db_connection():
+    # Parse DATABASE_URL
+    import urllib.parse as urlparse
+    url = urlparse.urlparse(SUPABASE_DB_URL)
+    conn = psycopg2.connect(
+        host=url.hostname,
+        port=url.port,
+        database=url.path[1:],  # remove leading '/'
+        user=url.username,
+        password=url.password,
+        sslmode='require'
+    )
+    return conn
+
 def save_post(title: str, content: str, message_id: int):
+    conn = get_db_connection()
+    cur = conn.cursor()
     try:
-        supabase.table("processed_posts").insert({
-            "title": title,
-            "content": content,
-            "message_id": message_id
-        }).execute()
+        cur.execute("""
+            INSERT INTO processed_posts (title, content, message_id)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (title) DO NOTHING;
+        """, (title, content, message_id))
+        conn.commit()
     except Exception as e:
         logging.error(f"DB insert error: {e}")
+    finally:
+        cur.close()
+        conn.close()
 
 def is_duplicate(title: str) -> bool:
+    conn = get_db_connection()
+    cur = conn.cursor()
     try:
-        res = supabase.table("processed_posts").select("id").eq("title", title).execute()
-        return len(res.data) > 0
+        cur.execute("SELECT 1 FROM processed_posts WHERE title = %s LIMIT 1;", (title,))
+        exists = cur.fetchone() is not None
+        return exists
     except Exception as e:
         logging.error(f"DB check error: {e}")
         return False
+    finally:
+        cur.close()
+        conn.close()
 
 def get_posts_since(since_dt):
+    conn = get_db_connection()
+    cur = conn.cursor()
     try:
-        res = supabase.table("processed_posts") \
-            .select("title, content, created_at") \
-            .gte("created_at", since_dt.isoformat()) \
-            .order("created_at", desc=True) \
-            .execute()
-        return res.data
+        cur.execute("""
+            SELECT title, content, created_at
+            FROM processed_posts
+            WHERE created_at >= %s
+            ORDER BY created_at DESC;
+        """, (since_dt.isoformat(),))
+        rows = cur.fetchall()
+        # Возвращаем список словарей для совместимости
+        return [{"title": r[0], "content": r[1], "created_at": r[2].isoformat()} for r in rows]
     except Exception as e:
         logging.error(f"DB fetch error: {e}")
         return []
+    finally:
+        cur.close()
+        conn.close()
 
 # === Генерация аналитики (без LLM) ===
 def generate_summary(period_name: str, posts: list) -> str:
@@ -81,7 +113,7 @@ def generate_summary(period_name: str, posts: list) -> str:
 
     text = f"📊 *{period_name}*\n\n"
     first = datetime.fromisoformat(posts[-1]["created_at"].replace("Z", "+00:00")).strftime("%d.%m.%Y")
-    last = datetime.fromisoformat(posts[0]["created_at"].replace("Z", "+00:00")).strftime("%d.%m.%Y")
+    last = datetime.fromisoformat(posts[0]["created_at"].replace("Z", "+00:00")).strftime("%d.%м.%Y")
     text += f"Период: {first} – {last}\n"
     text += f"Уникальных постов: {len(posts)}\n\n"
 
@@ -109,8 +141,6 @@ async def send_summary_to_channel(period_name: str, days: int):
 # === HTTP-сервер для cron (теперь использует переменную PORT) ===
 class CronHandler(BaseHTTPRequestHandler):
     def do_POST(self):
-        # Используем asyncio.run в отдельном потоке, если нужно, но для простоты:
-        # Запускаем корутину в основном цикле (это работает в потоке)
         try:
             if self.path == "/daily":
                 asyncio.run(send_summary_to_channel("Аналитическая записка за день", 1))
@@ -137,9 +167,8 @@ class CronHandler(BaseHTTPRequestHandler):
             self.wfile.write(b"Internal Server Error")
 
 def start_http_server():
-    # Получаем порт из переменной окружения PORT (Render передаёт её)
-    port = int(os.environ.get('PORT', 8000))  # Используем 8000 как fallback, но Render даст PORT
-    server = HTTPServer(('0.0.0.0', port), CronHandler) # Обязательно bind на 0.0.0.0
+    port = int(os.environ.get('PORT', 8000))
+    server = HTTPServer(('0.0.0.0', port), CronHandler)
     server.serve_forever()
 
 # === Обработка постов из канала ===
