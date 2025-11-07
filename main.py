@@ -1,0 +1,156 @@
+# main.py
+import os
+import logging
+import asyncio
+from datetime import datetime, timedelta, timezone
+from telegram import Bot
+from telegram.ext import Application, MessageHandler, filters
+from supabase import create_client
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import threading
+import json
+
+# === Конфигурация ===
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHANNEL_ID = os.getenv("CHANNEL_ID")  # Например: @finanosint или -1001234567890
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+if not all([BOT_TOKEN, CHANNEL_ID, SUPABASE_URL, SUPABASE_KEY]):
+    raise EnvironmentError("Missing required environment variables")
+
+bot = Bot(token=BOT_TOKEN)
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+logging.basicConfig(level=logging.INFO)
+
+# === Работа с БД ===
+def save_post(title: str, content: str, message_id: int):
+    try:
+        supabase.table("processed_posts").insert({
+            "title": title,
+            "content": content,
+            "message_id": message_id
+        }).execute()
+    except Exception as e:
+        logging.error(f"DB insert error: {e}")
+
+def is_duplicate(title: str) -> bool:
+    try:
+        res = supabase.table("processed_posts").select("id").eq("title", title).execute()
+        return len(res.data) > 0
+    except Exception as e:
+        logging.error(f"DB check error: {e}")
+        return False
+
+def get_posts_since(since_dt):
+    try:
+        res = supabase.table("processed_posts") \
+            .select("title, content, created_at") \
+            .gte("created_at", since_dt.isoformat()) \
+            .order("created_at", desc=True) \
+            .execute()
+        return res.data
+    except Exception as e:
+        logging.error(f"DB fetch error: {e}")
+        return []
+
+# === Генерация аналитики (без LLM) ===
+def generate_summary(period_name: str, posts: list) -> str:
+    if not posts:
+        return f"📊 *{period_name}*\n\nНет данных за указанный период."
+
+    # Подсчёт ключевых тем
+    keywords = {
+        "санкции": 0,
+        "Россия": 0,
+        "Китай": 0,
+        "энергетика": 0,
+        "рубль": 0,
+        "Евразия": 0,
+        "безопасность": 0,
+        "торговля": 0,
+        "технологии": 0,
+    }
+
+    full_text = " ".join([p.get("title", "") + " " + p.get("content", "") for p in posts]).lower()
+    for kw in keywords:
+        keywords[kw] = full_text.count(kw)
+
+    top_topics = sorted([(k, v) for k, v in keywords.items() if v > 0], key=lambda x: x[1], reverse=True)[:5]
+
+    text = f"📊 *{period_name}*\n\n"
+    first = datetime.fromisoformat(posts[-1]["created_at"].replace("Z", "+00:00")).strftime("%d.%m.%Y")
+    last = datetime.fromisoformat(posts[0]["created_at"].replace("Z", "+00:00")).strftime("%d.%m.%Y")
+    text += f"Период: {first} – {last}\n"
+    text += f"Уникальных постов: {len(posts)}\n\n"
+
+    if top_topics:
+        text += "Ключевые темы:\n"
+        for topic, count in top_topics:
+            text += f"• {topic.capitalize()} ({count})\n"
+    else:
+        text += "Ключевые темы не выявлены.\n"
+
+    text += "\n— Аналитика подготовлена автоматически."
+    return text
+
+# === Отправка в канал ===
+async def send_summary_to_channel(period_name: str, days: int):
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    posts = get_posts_since(since)
+    message = generate_summary(period_name, posts)
+    try:
+        await bot.send_message(chat_id=CHANNEL_ID, text=message, parse_mode="Markdown")
+        logging.info(f"Sent: {period_name}")
+    except Exception as e:
+        logging.error(f"Send error: {e}")
+
+# === HTTP-сервер для cron ===
+class CronHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        asyncio.run(self.handle_request())
+
+    async def handle_request(self):
+        if self.path == "/daily":
+            await send_summary_to_channel("Аналитическая записка за день", 1)
+        elif self.path == "/weekly":
+            await send_summary_to_channel("Аналитическая записка за неделю", 7)
+        elif self.path == "/monthly":
+            await send_summary_to_channel("Аналитическая записка за месяц", 30)
+        elif self.path == "/halfyear":
+            await send_summary_to_channel("Аналитическая записка за 6 месяцев", 183)
+        elif self.path == "/yearly":
+            await send_summary_to_channel("Аналитическая записка за год", 365)
+        else:
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+def start_http_server():
+    server = HTTPServer(("", 8000), CronHandler)
+    server.serve_forever()
+
+# === Обработка постов из канала ===
+async def handle_channel_post(update, context):
+    post = update.channel_post
+    if not post or not post.text:
+        return
+    title = post.text.split('\n')[0][:150]
+    if is_duplicate(title):
+        return
+    save_post(title, post.text, post.message_id)
+
+# === Запуск ===
+if __name__ == "__main__":
+    # Запуск HTTP-сервера в фоне
+    threading.Thread(target=start_http_server, daemon=True).start()
+
+    # Запуск Telegram-бота
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(MessageHandler(filters.CHANNEL_POST, handle_channel_post))
+    app.run_polling()
