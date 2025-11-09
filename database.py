@@ -1,6 +1,6 @@
 import os
-from supabase import create_client, Client
 import logging
+from supabase import create_client, Client
 
 # 🔐 Секреты только через переменные окружения — НИКАКИХ .env
 SUPABASE_URL = os.getenv("SUPABASE_URL")
