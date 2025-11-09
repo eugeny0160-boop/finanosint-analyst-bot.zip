@@ -110,11 +110,14 @@ async def trigger_yearly():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Запускаем бота в фоне
     task = asyncio.create_task(dp.start_polling(bot))
     yield
+    # Завершаем бота при выключении
     await bot.session.close()
     task.cancel()
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", 10000)), reload=False)
+    port = int(os.getenv("PORT", 10000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, lifespan="on")
