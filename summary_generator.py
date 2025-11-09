@@ -1,7 +1,7 @@
 import os
+import logging
 from datetime import datetime, timedelta
 from database import get_news_by_period, insert_summary
-import logging
 
 def generate_summary_text(news_list, period):
     if not news_list:
